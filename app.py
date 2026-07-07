@@ -1,12 +1,31 @@
 # app.py
 import streamlit as st
-import cv2
-import face_recognition
 import numpy as np
 import os
 import pickle
-from PIL import Image
 import tempfile
+import sys
+
+# Try to import opencv with better error handling
+try:
+    import cv2
+except ImportError:
+    st.error("""
+    ⚠️ OpenCV is not installed. Please check your requirements.txt.
+    Make sure opencv-python-headless is in your requirements file.
+    """)
+    st.stop()
+
+try:
+    import face_recognition
+except ImportError:
+    st.error("""
+    ⚠️ Face Recognition library is not installed.
+    Make sure face-recognition is in your requirements.txt file.
+    """)
+    st.stop()
+
+from PIL import Image
 
 # Page configuration
 st.set_page_config(
@@ -90,6 +109,13 @@ st.markdown("""
             border-top: 1px solid #ecf0f1;
             padding-top: 1.5rem;
         }
+        .error-box {
+            background-color: #ffe6e6;
+            border: 1px solid #ff6b6b;
+            border-radius: 10px;
+            padding: 1rem;
+            margin: 1rem 0;
+        }
     </style>
 """, unsafe_allow_html=True)
 
@@ -103,6 +129,31 @@ if 'model_loaded' not in st.session_state:
     st.session_state.known_encodings = []
     st.session_state.known_names = []
 
+def train_from_dataset():
+    """Train the face recognition model from images in the imagebase folder"""
+    KNOWN_FACES_DIR = "imagebase"
+    known_encodings = []
+    known_names = []
+    
+    if not os.path.exists(KNOWN_FACES_DIR):
+        return [], []
+    
+    for filename in os.listdir(KNOWN_FACES_DIR):
+        if filename.lower().endswith((".jpg", ".jpeg", ".png")):
+            path = os.path.join(KNOWN_FACES_DIR, filename)
+            name = os.path.splitext(filename)[0].capitalize()
+            
+            try:
+                img = face_recognition.load_image_file(path)
+                encs = face_recognition.face_encodings(img)
+                if len(encs) > 0:
+                    known_encodings.append(encs[0])
+                    known_names.append(name)
+            except Exception as e:
+                st.warning(f"Could not process {filename}: {e}")
+    
+    return known_encodings, known_names
+
 # Load the pre-trained model
 @st.cache_resource
 def load_model():
@@ -114,29 +165,16 @@ def load_model():
         try:
             with open(model_path, "rb") as f:
                 model_data = pickle.load(f)
-            return model_data['encodings'], model_data['names']
+            if model_data['encodings'] and model_data['names']:
+                return model_data['encodings'], model_data['names']
         except Exception as e:
-            st.error(f"Error loading model: {e}")
-            return [], []
+            st.warning(f"Could not load model file: {e}")
     
-    # Fallback: Try to load from /kaggle/working path (for Kaggle compatibility)
-    kaggle_path = "/kaggle/working/face_recognition_model.pkl"
-    if os.path.exists(kaggle_path):
-        try:
-            with open(kaggle_path, "rb") as f:
-                model_data = pickle.load(f)
-            return model_data['encodings'], model_data['names']
-        except Exception as e:
-            st.error(f"Error loading model from Kaggle path: {e}")
-            return [], []
+    # Fallback: Try to train from images
+    encodings, names = train_from_dataset()
+    if encodings:
+        return encodings, names
     
-    # If no model found, show error
-    st.error("""
-    ⚠️ **Model file not found!**
-    
-    Please make sure `face_recognition_model.pkl` is in the same directory as this app.
-    You can download it from Kaggle or train the model using the provided notebook.
-    """)
     return [], []
 
 # Load the model
@@ -156,7 +194,15 @@ if known_names:
     </div>
     """, unsafe_allow_html=True)
 else:
-    st.warning("⚠️ No model loaded. Please ensure the model file is available.")
+    st.warning("""
+    ⚠️ **No model loaded!**
+    
+    To fix this:
+    1. Add a folder named `imagebase` to your repository
+    2. Put photos of your friends in it (named like `amna.jpg`, `alishba.jpg`, etc.)
+    3. Commit and push to GitHub
+    4. Streamlit will auto-deploy the update
+    """)
 
 # Upload Section
 st.markdown("### 📤 Upload a Photo")
@@ -170,11 +216,9 @@ uploaded_file = st.file_uploader(
 
 # Process uploaded image
 if uploaded_file is not None and st.session_state.model_loaded:
-    # Create a placeholder for the image
     image_placeholder = st.empty()
     result_placeholder = st.empty()
     
-    # Read the image
     try:
         file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
         image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
@@ -246,19 +290,27 @@ if uploaded_file is not None and st.session_state.model_loaded:
                 if len(face_locations) == 0:
                     st.warning("😕 No faces detected in the image. Try another photo with visible faces.")
                 else:
-                    # Create a nice summary
-                    recognized = []
-                    for name in [st.session_state.known_names[best_match_index] if matches[best_match_index] else "Unknown" 
-                                 for matches, best_match_index in 
-                                 [(matches, np.argmin(face_distances)) if len(face_distances) > 0 else (False, 0)
-                                  for face_encoding in face_encodings
-                                  for matches in [face_recognition.compare_faces(st.session_state.known_encodings, face_encoding, tolerance=0.55)]
-                                  for face_distances in [face_recognition.face_distance(st.session_state.known_encodings, face_encoding)]]]:
-                        recognized.append(name)
+                    # Count recognized faces
+                    recognized_names = []
+                    for encoding in face_encodings:
+                        matches = face_recognition.compare_faces(
+                            st.session_state.known_encodings, 
+                            encoding, 
+                            tolerance=0.55
+                        )
+                        name = "Unknown"
+                        face_distances = face_recognition.face_distance(
+                            st.session_state.known_encodings, 
+                            encoding
+                        )
+                        if len(face_distances) > 0:
+                            best_match_index = np.argmin(face_distances)
+                            if matches[best_match_index]:
+                                name = st.session_state.known_names[best_match_index]
+                        recognized_names.append(name)
                     
-                    # Count recognized vs unknown
-                    known_count = sum(1 for n in recognized if n != "Unknown")
-                    unknown_count = len(recognized) - known_count
+                    known_count = sum(1 for n in recognized_names if n != "Unknown")
+                    unknown_count = len(recognized_names) - known_count
                     
                     col1, col2, col3 = st.columns(3)
                     with col1:
@@ -268,12 +320,10 @@ if uploaded_file is not None and st.session_state.model_loaded:
                     with col3:
                         st.metric("❓ Unknown", unknown_count)
                     
-                    # Show which friends were recognized
                     if known_count > 0:
-                        friends_found = list(set([n for n in recognized if n != "Unknown"]))
+                        friends_found = list(set([n for n in recognized_names if n != "Unknown"]))
                         st.markdown(f"**Friends identified:** {', '.join(friends_found)}")
                         
-                        # Emoji celebration
                         if len(friends_found) == len(face_locations):
                             st.success("🎉 All faces recognized successfully!")
                         else:
@@ -283,7 +333,7 @@ if uploaded_file is not None and st.session_state.model_loaded:
         st.error(f"❌ An error occurred while processing the image: {e}")
 
 elif uploaded_file is not None and not st.session_state.model_loaded:
-    st.error("⚠️ Model not loaded. Please check the model file.")
+    st.error("⚠️ Model not loaded. Please add images to the 'imagebase' folder.")
 
 # Empty state - show upload prompt
 if uploaded_file is None:
@@ -295,7 +345,6 @@ if uploaded_file is None:
     </div>
     """, unsafe_allow_html=True)
     
-    # Show sample info
     if st.session_state.model_loaded:
         st.markdown(f"""
         <div style="background-color: #f8f9fa; border-radius: 10px; padding: 1rem; margin-top: 1.5rem;">
